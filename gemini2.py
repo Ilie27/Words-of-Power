@@ -1,7 +1,6 @@
 import asyncio
 import os
 import csv
-import ast
 import json
 import re
 from dotenv import load_dotenv
@@ -15,6 +14,7 @@ load_dotenv()
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-pro")
 
+# Your 58 powerful words (excluding Supermassive Black Hole and Entropy)
 your_words = [
     "Feather", "Coal", "Pebble", "Leaf", "Paper", "Rock", "Water", "Twig", "Sword", "Shield",
     "Gun", "Flame", "Rope", "Disease", "Cure", "Bacteria", "Shadow", "Light", "Virus", "Sound",
@@ -25,28 +25,29 @@ your_words = [
     "Human Spirit", "Apocalyptic Meteor", "Earth's Core", "Neutron Star"
 ]
 
-# # Read first 200 lines from nounlist.txt
-# with open("nounlist.txt", "r") as f:
-#     all_nouns = [line.strip() for line in f.readlines() if line.strip()]
-
-
 # Load all nouns from nounlist.txt
 with open("nounlist.txt", "r") as f:
     all_nouns = [line.strip() for line in f if line.strip()]
 
 # Load already processed words
 processed_words = set()
-if os.path.exists("large_beat_map_binary.csv"):
-    df = pd.read_csv("large_beat_map_binary.csv")
+output_csv = "large_beat_map_binary.csv"
+if os.path.exists(output_csv):
+    df = pd.read_csv(output_csv)
     processed_words = set(df["word"].str.strip().str.lower())
 
-# Filter only unprocessed nouns (case-insensitive match)
-common_nouns = [w for w in all_nouns if w.lower() not in processed_words]    
+# Filter unprocessed nouns
+common_nouns = [w for w in all_nouns if w.lower() not in processed_words]
+print(f"🧠 Total nouns: {len(all_nouns)} | Processed: {len(processed_words)} | Remaining: {len(common_nouns)}")
 
+# Clean and filter Gemini's JSON response
+def clean_and_filter_json(text, allowed_words):
+    text = re.sub(r"//.*", "", text)
+    text = text.replace("'", '"')
+    parsed = json.loads(text)
+    return {k: [w for w in v if w in allowed_words] for k, v in parsed.items()}
 
-
-output_csv = "large_beat_map_binary.csv"
-
+# Build the Gemini prompt
 def build_batch_prompt(target_words):
     return f"""
 You are playing a metaphorical combat game where every word is a weapon. You must determine which of the following 58 words can beat each given target word.
@@ -56,7 +57,7 @@ Each player word can beat certain types of targets in poetic, symbolic, physical
 A word "beats" another if it can overpower, destroy, disable, outmatch, nullify, counteract, or metaphorically dominate it.
 
 ## Examples of reasoning:
-- Choose **Gun**, or **Sword**,**Disease** for everything alive that can be killed (e.g., "Lion", "Intruder").
+- Choose **Gun**, or **Sword**, **Disease** for everything alive that can be killed (e.g., "Lion", "Intruder").
 - Choose **Water**, **Tsunami**, or **Ice** for things that can be extinguished or overwhelmed (e.g., "Flame", "Fire", "Desert").
 - Choose **Rock**, **Earthquake**, or **Explosion** for things that can be physically broken or destroyed (e.g., "Glass", "PC", "Statue").
 - Choose **Rope** or **Gravity** for something that can be tied down, restrained, or pulled (e.g., "Balloon", "Drone", "Elevator").
@@ -89,16 +90,17 @@ Return ONLY a JSON object with one entry per target word. Each value should be a
 }}
 """
 
-failures = 0
-MAX_FAILURES = 5
-
+# Async Gemini runner
 async def build_beat_database():
-    # Write CSV headers
-    with open(output_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["word"] + your_words)
+    # Write header if CSV doesn't exist
+    if not os.path.exists(output_csv):
+        with open(output_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["word"] + your_words)
 
-    # Process in batches of 20
+    failures = 0
+    MAX_FAILURES = 5
+
     for i in range(0, len(common_nouns), 20):
         batch = common_nouns[i:i+20]
         prompt = build_batch_prompt(batch)
@@ -108,24 +110,28 @@ async def build_beat_database():
             response = model.generate_content(prompt)
             text = response.text.strip()
 
-            # Clean markdown/code block if needed
             if "```" in text:
                 match = re.search(r"\{.*\}", text, re.DOTALL)
                 if match:
                     text = match.group(0)
 
             try:
-                results = json.loads(text)
+                results = clean_and_filter_json(text, your_words)
                 with open(output_csv, "a", newline="") as f:
                     writer = csv.writer(f)
                     for word in batch:
-                        word_clean = word.lower()
-                        matched = results.get(word) or results.get(word.title()) or results.get(word_clean) or []
+                        key = word.strip()
+                        matched = results.get(key) or results.get(key.title()) or results.get(key.lower()) or []
                         binary_vector = [1 if w in matched else 0 for w in your_words]
                         writer.writerow([word] + binary_vector)
                         print(f"✅ Mapped {word}: {matched}")
+                failures = 0
             except Exception as e:
+                failures += 1
                 print(f"⚠️ Failed to parse JSON: {e}\n{text}")
+                if failures > MAX_FAILURES:
+                    print("❌ Too many consecutive failures. Stopping.")
+                    break
 
         except Exception as e:
             failures += 1
